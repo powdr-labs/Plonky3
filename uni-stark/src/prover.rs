@@ -126,7 +126,15 @@ where
             );
         });
 
-    finish(pcs, proving_key, challenger, air, committed_data)
+    finish(
+        pcs,
+        proving_key,
+        log_degree,
+        trace_domain,
+        challenger,
+        air,
+        committed_data,
+    )
 }
 
 #[instrument(skip_all)]
@@ -150,8 +158,6 @@ where
     SC: StarkGenericConfig + PolynomialSpace,
     A: Air<SymbolicAirBuilder<Val<SC>>> + for<'a> Air<ProverConstraintFolder<'a, SC>>,
 {
-    // we need sme kind of callback to
-
     let (trace_commit, trace_data) =
         info_span!("commit to trace data").in_scope(|| pcs.commit(vec![(trace_domain, trace)]));
 
@@ -179,17 +185,22 @@ pub fn finish<
 >(
     pcs: &<SC as StarkGenericConfig>::Pcs,
     proving_key: Option<&StarkProvingKey<SC>>,
+    log_degree: usize,
+    trace_domain: <<SC as StarkGenericConfig>::Pcs as Pcs<
+        <SC as StarkGenericConfig>::Challenge,
+        <SC as StarkGenericConfig>::Challenger,
+    >>::Domain,
     challenger: &mut SC::Challenger,
     air: &A,
-    commited_data: Option<&mut CommittedData<SC>>,
+    committed_data: Option<&mut CommittedData<SC>>,
 ) -> Proof<SC>
 where
-    SC: StarkGenericConfig,
+    SC: StarkGenericConfig + p3_commit::PolynomialSpace,
     A: Air<SymbolicAirBuilder<Val<SC>>> + for<'a> Air<ProverConstraintFolder<'a, SC>>,
 {
     // changes for challenges
-
-    let log_quotient_degree = get_log_quotient_degree::<Val<SC>, A>(air, public_values.len());
+    let log_quotient_degree =
+        get_log_quotient_degree::<Val<SC>, A>(air, committed_data.unwrap().public_values.len());
     let quotient_degree = 1 << log_quotient_degree;
 
     let alpha: SC::Challenge = challenger.sample_ext_element();
