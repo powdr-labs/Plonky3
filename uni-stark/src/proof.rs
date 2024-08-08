@@ -1,6 +1,8 @@
+use alloc::collections::btree_map::BTreeMap;
 use alloc::vec::Vec;
 
 use p3_commit::{Pcs, PolynomialSpace, Val};
+use p3_matrix::dense::RowMajorMatrix;
 use serde::{Deserialize, Serialize};
 
 use crate::StarkGenericConfig;
@@ -70,4 +72,12 @@ impl<SC: StarkGenericConfig + PolynomialSpace> CommittedData<SC> {
         self.traces.push(trace);
         self.public_values.push(publics);
     }
+}
+
+pub trait NextStageTraceCallback<SC: StarkGenericConfig, T> {
+    fn get_next_stage_trace(
+        &self,
+        trace_stage: u32,
+        challenge_values: BTreeMap<u64, SC::Challenge>,
+    ) -> RowMajorMatrix<T>;
 }

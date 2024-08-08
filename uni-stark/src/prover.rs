@@ -16,8 +16,8 @@ use tracing::{info_span, instrument};
 
 use crate::symbolic_builder::{get_log_quotient_degree, SymbolicAirBuilder};
 use crate::{
-    Commitments, CommittedData, Domain, OpenedValues, PackedChallenge, PackedVal, Proof,
-    ProverConstraintFolder, StarkGenericConfig, StarkProvingKey, Val,
+    Commitments, CommittedData, Domain, NextStageTraceCallback, OpenedValues, PackedChallenge,
+    PackedVal, Proof, ProverConstraintFolder, StarkGenericConfig, StarkProvingKey, Val,
 };
 
 #[instrument(skip_all)]
@@ -26,18 +26,20 @@ pub fn prove<
     SC,
     #[cfg(debug_assertions)] A: for<'a> Air<crate::check_constraints::DebugConstraintBuilder<'a, Val<SC>>>,
     #[cfg(not(debug_assertions))] A,
+    T,
 >(
     config: &SC,
     air: &A,
     challenger: &mut SC::Challenger,
     challenges: Vec<Vec<u64>>,
     main_trace: RowMajorMatrix<Val<SC>>,
-    multi_stage_trace: Vec<RowMajorMatrix<Val<SC>>>,
+    next_stage_trace_callback: Option<&T>,
     public_values: &Vec<Val<SC>>,
 ) -> Proof<SC>
 where
     SC: StarkGenericConfig,
     A: Air<SymbolicAirBuilder<Val<SC>>> + for<'a> Air<ProverConstraintFolder<'a, SC>>,
+    T: NextStageTraceCallback<SC, Val<SC>>,
 {
     prove_with_key(
         config,
@@ -46,6 +48,7 @@ where
         challenger,
         challenges,
         main_trace,
+        next_stage_trace_callback,
         public_values,
     )
 }
@@ -56,6 +59,7 @@ pub fn prove_with_key<
     SC,
     #[cfg(debug_assertions)] A: for<'a> Air<crate::check_constraints::DebugConstraintBuilder<'a, Val<SC>>>,
     #[cfg(not(debug_assertions))] A,
+    T,
 >(
     config: &SC,
     proving_key: Option<&StarkProvingKey<SC>>,
@@ -63,12 +67,13 @@ pub fn prove_with_key<
     challenger: &mut SC::Challenger,
     challenges: Vec<Vec<u64>>,
     main_trace: RowMajorMatrix<Val<SC>>,
-    next_stage_callback: Option<SC>,
+    next_stage_trace_callback: Option<&T>,
     public_values: &Vec<Val<SC>>,
 ) -> Proof<SC>
 where
     SC: StarkGenericConfig,
     A: Air<SymbolicAirBuilder<Val<SC>>> + for<'a> Air<ProverConstraintFolder<'a, SC>>,
+    T: NextStageTraceCallback<SC, Val<SC>>,
 {
     let degree = main_trace.height(); // all traces have the same height
     let log_degree = log2_strict_usize(degree);
@@ -95,27 +100,28 @@ where
     );
 
     challenges
-        .iter()
+        .into_iter()
         .enumerate()
-        .map(|(stage, stage_challenges)| {
+        .for_each(|(stage, stage_challenges)| {
             let challenge_values = stage_challenges
                 .iter()
                 .map(|id| {
-                    let challenge = challenger.sample();
+                    let challenge: SC::Challenge = challenger.sample();
                     (*id, challenge)
                 })
                 .collect::<BTreeMap<u64, SC::Challenge>>();
 
             // calculating next stage trace
-            let next_stage_trace = next_stage_callback
-                .as_ref()
-                .get_trace(stage, challenge_values); // callback to generate trace
+            let next_stage_trace = next_stage_trace_callback
+                .unwrap()
+                .get_next_stage_trace(stage as u32, challenge_values); // callback to generate trace, this has to store
+
             committed_data = run_stage(
                 challenger,
                 pcs,
                 trace_domain,
                 main_trace,
-                &challenge_values,
+                &challenge_values.values().collect(),
                 committed_data,
             );
         });
