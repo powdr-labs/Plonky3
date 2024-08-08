@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use p3_commit::Pcs;
+use p3_commit::{Pcs, PolynomialSpace, Val};
 use serde::{Deserialize, Serialize};
 
 use crate::StarkGenericConfig;
@@ -51,4 +51,23 @@ pub struct StarkProvingKey<SC: StarkGenericConfig> {
 #[serde(bound = "")]
 pub struct StarkVerifyingKey<SC: StarkGenericConfig> {
     pub preprocessed_commit: Com<SC>,
+}
+
+pub struct CommittedData<SC: StarkGenericConfig + PolynomialSpace> {
+    pub(crate) trace_commits: Vec<Com<SC>>,
+    pub(crate) traces: Vec<PcsProverData<SC>>,
+    pub(crate) public_values: Vec<Vec<Val<SC>>>, // should also include challenge values
+}
+
+impl<SC: StarkGenericConfig + PolynomialSpace> CommittedData<SC> {
+    pub(crate) fn update_stage(
+        &mut self,
+        trace_commit: Com<SC>,
+        trace: PcsProverData<SC>,
+        publics: Vec<Val<SC>>,
+    ) {
+        self.trace_commits.push(trace_commit);
+        self.traces.push(trace);
+        self.public_values.push(publics);
+    }
 }
