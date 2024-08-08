@@ -1,3 +1,4 @@
+use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::iter;
@@ -15,8 +16,8 @@ use tracing::{info_span, instrument};
 
 use crate::symbolic_builder::{get_log_quotient_degree, SymbolicAirBuilder};
 use crate::{
-    Commitments, Domain, OpenedValues, PackedChallenge, PackedVal, Proof, ProverConstraintFolder,
-    StarkGenericConfig, StarkProvingKey, Val,
+    Commitments, CommittedData, Domain, NextStageTraceCallback, OpenedValues, PackedChallenge,
+    PackedVal, Proof, ProverConstraintFolder, StarkGenericConfig, StarkProvingKey, Val,
 };
 
 #[instrument(skip_all)]
@@ -25,18 +26,31 @@ pub fn prove<
     SC,
     #[cfg(debug_assertions)] A: for<'a> Air<crate::check_constraints::DebugConstraintBuilder<'a, Val<SC>>>,
     #[cfg(not(debug_assertions))] A,
+    T,
 >(
     config: &SC,
     air: &A,
     challenger: &mut SC::Challenger,
-    trace: RowMajorMatrix<Val<SC>>,
+    challenges: Vec<Vec<u64>>,
+    main_trace: RowMajorMatrix<Val<SC>>,
+    next_stage_trace_callback: Option<&T>,
     public_values: &Vec<Val<SC>>,
 ) -> Proof<SC>
 where
     SC: StarkGenericConfig,
     A: Air<SymbolicAirBuilder<Val<SC>>> + for<'a> Air<ProverConstraintFolder<'a, SC>>,
+    T: NextStageTraceCallback<SC, Val<SC>>,
 {
-    prove_with_key(config, None, air, challenger, trace, public_values)
+    prove_with_key(
+        config,
+        None,
+        air,
+        challenger,
+        challenges,
+        main_trace,
+        next_stage_trace_callback,
+        public_values,
+    )
 }
 
 #[instrument(skip_all)]
@@ -45,48 +59,150 @@ pub fn prove_with_key<
     SC,
     #[cfg(debug_assertions)] A: for<'a> Air<crate::check_constraints::DebugConstraintBuilder<'a, Val<SC>>>,
     #[cfg(not(debug_assertions))] A,
+    T,
 >(
     config: &SC,
     proving_key: Option<&StarkProvingKey<SC>>,
     air: &A,
     challenger: &mut SC::Challenger,
-    trace: RowMajorMatrix<Val<SC>>,
+    challenges: Vec<Vec<u64>>,
+    main_trace: RowMajorMatrix<Val<SC>>,
+    next_stage_trace_callback: Option<&T>,
     public_values: &Vec<Val<SC>>,
 ) -> Proof<SC>
 where
     SC: StarkGenericConfig,
     A: Air<SymbolicAirBuilder<Val<SC>>> + for<'a> Air<ProverConstraintFolder<'a, SC>>,
+    T: NextStageTraceCallback<SC, Val<SC>>,
 {
-    #[cfg(debug_assertions)]
-    crate::check_constraints::check_constraints(
-        air,
-        &air.preprocessed_trace()
-            .unwrap_or(RowMajorMatrix::new(vec![], 0)),
-        &trace,
-        public_values,
-    );
-
-    let degree = trace.height();
+    let degree = main_trace.height(); // all traces have the same height
     let log_degree = log2_strict_usize(degree);
-
-    let log_quotient_degree = get_log_quotient_degree::<Val<SC>, A>(air, public_values.len());
-    let quotient_degree = 1 << log_quotient_degree;
 
     let pcs = config.pcs();
     let trace_domain = pcs.natural_domain_for_degree(degree);
 
-    let (trace_commit, trace_data) =
-        info_span!("commit to trace data").in_scope(|| pcs.commit(vec![(trace_domain, trace)]));
-
-    // Observe the instance.
+    // Observe the instance
     challenger.observe(Val::<SC>::from_canonical_usize(log_degree));
     // TODO: Might be best practice to include other instance data here; see verifier comment.
 
     if let Some(proving_key) = proving_key {
         challenger.observe(proving_key.preprocessed_commit.clone())
     };
+
+    // commitments to main trace
+    let committed_data = run_stage(
+        challenger,
+        pcs,
+        trace_domain,
+        main_trace,
+        public_values,
+        None,
+    );
+
+    challenges
+        .into_iter()
+        .enumerate()
+        .for_each(|(stage, stage_challenges)| {
+            let challenge_values = stage_challenges
+                .iter()
+                .map(|id| {
+                    let challenge: SC::Challenge = challenger.sample();
+                    (*id, challenge)
+                })
+                .collect::<BTreeMap<u64, SC::Challenge>>();
+
+            // calculating next stage trace
+            let next_stage_trace = next_stage_trace_callback
+                .unwrap()
+                .get_next_stage_trace(stage as u32, challenge_values); // callback to generate trace, this has to store
+
+            committed_data = run_stage(
+                challenger,
+                pcs,
+                trace_domain,
+                main_trace,
+                &challenge_values.values().collect(),
+                committed_data,
+            );
+        });
+
+    finish(
+        pcs,
+        proving_key,
+        log_degree,
+        trace_domain,
+        challenger,
+        air,
+        committed_data,
+    )
+}
+
+#[instrument(skip_all)]
+#[allow(clippy::multiple_bound_locations)] // cfg not supported in where clauses?
+pub fn run_stage<
+    SC,
+    #[cfg(debug_assertions)] A: for<'a> Air<crate::check_constraints::DebugConstraintBuilder<'a, Val<SC>>>,
+    #[cfg(not(debug_assertions))] A,
+>(
+    challenger: &mut SC::Challenger,
+    pcs: &<SC as StarkGenericConfig>::Pcs,
+    trace_domain: <<SC as StarkGenericConfig>::Pcs as Pcs<
+        <SC as StarkGenericConfig>::Challenge,
+        <SC as StarkGenericConfig>::Challenger,
+    >>::Domain,
+    trace: RowMajorMatrix<Val<SC>>,
+    public_values: &Vec<Val<SC>>,
+    committed_data: Option<&mut CommittedData<SC>>,
+) -> Option<&mut CommittedData<SC>>
+where
+    SC: StarkGenericConfig + PolynomialSpace,
+    A: Air<SymbolicAirBuilder<Val<SC>>> + for<'a> Air<ProverConstraintFolder<'a, SC>>,
+{
+    let (trace_commit, trace_data) =
+        info_span!("commit to trace data").in_scope(|| pcs.commit(vec![(trace_domain, trace)]));
+
     challenger.observe(trace_commit.clone());
     challenger.observe_slice(public_values);
+
+    committed_data
+        .unwrap_or(&mut CommittedData {
+            trace_commits: Vec::new(),
+            traces: Vec::new(),
+            public_values: Vec::new(),
+        })
+        .update_stage(trace_commit, trace_data, public_values);
+    // TODO: Might be best practice to include other instance data here; see verifier comment.
+
+    committed_data
+}
+
+#[instrument(skip_all)]
+#[allow(clippy::multiple_bound_locations)]
+pub fn finish<
+    SC,
+    #[cfg(debug_assertions)] A: for<'a> Air<crate::check_constraints::DebugConstraintBuilder<'a, Val<SC>>>,
+    #[cfg(not(debug_assertions))] A,
+>(
+    pcs: &<SC as StarkGenericConfig>::Pcs,
+    proving_key: Option<&StarkProvingKey<SC>>,
+    log_degree: usize,
+    trace_domain: <<SC as StarkGenericConfig>::Pcs as Pcs<
+        <SC as StarkGenericConfig>::Challenge,
+        <SC as StarkGenericConfig>::Challenger,
+    >>::Domain,
+    challenger: &mut SC::Challenger,
+    air: &A,
+    committed_data: Option<&mut CommittedData<SC>>,
+) -> Proof<SC>
+where
+    SC: StarkGenericConfig + p3_commit::PolynomialSpace,
+    A: Air<SymbolicAirBuilder<Val<SC>>> + for<'a> Air<ProverConstraintFolder<'a, SC>>,
+{
+    // changes for challenges
+    let log_quotient_degree =
+        get_log_quotient_degree::<Val<SC>, A>(air, committed_data.unwrap().public_values.len());
+    let quotient_degree = 1 << log_quotient_degree;
+
     let alpha: SC::Challenge = challenger.sample_ext_element();
 
     let quotient_domain =
@@ -98,6 +214,9 @@ where
 
     let trace_on_quotient_domain = pcs.get_evaluations_on_domain(&trace_data, 0, quotient_domain);
 
+    // let permutation_on_quotient_domain =
+    //     pcs.get_evaluations_on_domain(&permutation_trace, 0, quotient_domain);
+
     let quotient_values = quotient_values(
         air,
         public_values,
@@ -105,6 +224,7 @@ where
         quotient_domain,
         preprocessed_on_quotient_domain,
         trace_on_quotient_domain,
+        multistage_on_quotient_domain,
         alpha,
     );
     let quotient_flat = RowMajorMatrix::new_col(quotient_values).flatten_to_base();
@@ -182,6 +302,7 @@ where
     }
 }
 
+// TODO: finish
 #[instrument(name = "compute quotient polynomial", skip_all)]
 fn quotient_values<SC, A, Mat>(
     air: &A,
@@ -190,6 +311,7 @@ fn quotient_values<SC, A, Mat>(
     quotient_domain: Domain<SC>,
     preprocessed_on_quotient_domain: Option<Mat>,
     trace_on_quotient_domain: Mat,
+    multistage_on_quotient_domain: Option<Vec<Mat>>,
     alpha: SC::Challenge,
 ) -> Vec<SC::Challenge>
 where

@@ -12,6 +12,7 @@ pub(crate) fn check_constraints<F, A>(
     air: &A,
     preprocessed: &RowMajorMatrix<F>,
     main: &RowMajorMatrix<F>,
+    multi_stage: &Vec<&RowMajorMatrix<F>>,
     public_values: &Vec<F>,
 ) where
     F: Field,
